@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 if [[ -z "${WASI_SDK}" ]]; then
     echo "WASI_SDK is not found"
@@ -14,8 +14,9 @@ export RANLIB="$WASI_SDK/bin/ranlib"
 export AR="$WASI_SDK/bin/ar"
 export NM="$WASI_SDK/bin/nm"
 export CC="$WASI_SDK/bin/clang"
-export CXX="$WASI_SDK/bin/clang"
+export CXX="$WASI_SDK/bin/clang++"
 export CFLAGS="\
+--target=wasm32-wasi \
 --sysroot=$WASIX_SYSROOT \
 -matomics \
 -mbulk-memory \
@@ -67,6 +68,10 @@ export LIBS="\
 -flto"
 
 export WASMER=$(realpath "../../target/release/wasmer")
+if [[ -z "${WASMER}" ]]; then
+    echo "WASMER not found"
+    exit 1
+fi
 
 printf "\n\nStarting WASIX Test Suite:\n"
 

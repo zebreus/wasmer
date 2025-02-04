@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 set -u
 set -o pipefail
@@ -27,8 +27,8 @@ done
 mv invalid/*.wat malformed
 
 for wasm in invalid/*.wasm; do
-    if "$wabtbin/wasm2wat" "$wasm" -o invalid/t.wat 2>/dev/null && \
-       "$wabtbin/wat2wasm" invalid/t.wat -o /dev/null 2>/dev/null ; then
+    if "$wabtbin/wasm2wat" "$wasm" -o invalid/t.wat 2>/dev/null &&
+        "$wabtbin/wat2wasm" invalid/t.wat -o /dev/null 2>/dev/null; then
         mv "$wasm" valid
     fi
 done
