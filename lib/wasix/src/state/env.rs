@@ -11,8 +11,8 @@ use rand::Rng;
 use virtual_fs::{FileSystem, FsError, VirtualFile};
 use virtual_net::DynVirtualNetworking;
 use wasmer::{
-    AsStoreMut, AsStoreRef, FunctionEnvMut, Global, Imports, Instance, Memory, MemoryType,
-    MemoryView, Module, TypedFunction,
+    imports, AsStoreMut, AsStoreRef, FunctionEnvMut, Global, Imports, Instance, Memory, MemoryType,
+    MemoryView, Module, StoreMut, Table, TableType, TypedFunction, Value,
 };
 use wasmer_config::package::PackageSource;
 use wasmer_wasix_types::{
@@ -342,6 +342,17 @@ pub struct WasiEnv {
     ///  not be cloned when `WasiEnv` is cloned)
     /// TODO: We should move this outside of `WasiEnv` with some refactoring
     inner: WasiInstanceHandlesPointer,
+
+    /// TODO: Understand WasiInstanceHandles and use that instead
+    pub dynamic_library: Option<DynamicLibrary>,
+}
+
+struct DynamicLibrary {
+    pub instance: Instance,
+    /// Memory base address
+    pub memory_base: u32,
+    /// Function table base address
+    pub table_base: u32,
 }
 
 impl std::fmt::Debug for WasiEnv {
@@ -370,6 +381,7 @@ impl Clone for WasiEnv {
             enable_exponential_cpu_backoff: self.enable_exponential_cpu_backoff,
             replaying_journal: self.replaying_journal,
             disable_fs_cleanup: self.disable_fs_cleanup,
+            dynamic_library: None,
         }
     }
 }
@@ -410,6 +422,7 @@ impl WasiEnv {
             enable_exponential_cpu_backoff: self.enable_exponential_cpu_backoff,
             replaying_journal: false,
             disable_fs_cleanup: self.disable_fs_cleanup,
+            dynamic_library: None,
         };
         Ok((new_env, handle))
     }
@@ -544,6 +557,7 @@ impl WasiEnv {
             bin_factory: init.bin_factory,
             capabilities: init.capabilities,
             disable_fs_cleanup: false,
+            dynamic_library: None,
         };
         env.owned_handles.push(thread);
 
@@ -1341,5 +1355,66 @@ impl WasiEnv {
                 self.state.args.lock().unwrap()[0] = exec_name;
             }
         }
+    }
+
+    pub fn experimental_dlopen(
+        &mut self,
+        wasm: &[u8],
+        mut store: StoreMut<'_>,
+    ) -> Result<u32, WasiError> {
+        let module = Module::new(&self.runtime.engine(), wasm).unwrap();
+        let memory = unsafe { self.memory() }.clone();
+        let memory_base_value = 7000u32;
+        let table_base_value = 8000u32;
+        let memory_base = Global::new(&mut store, Value::I32(memory_base_value as i32));
+        let table_base = Global::new(&mut store, Value::I32(table_base_value as i32));
+        let stack_pointer = Global::new(&mut store, Value::I32(12000 as i32));
+
+        let table_type = TableType::new(wasmer::Type::FuncRef, 1, Some(1)); // anyref => ExternRef in Wasmer
+        let table = Table::new(&mut store, table_type, Value::FuncRef(None)).unwrap();
+
+        let module_imports = imports! {
+            "env" => {
+                // These five imports are described in
+                // https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md#interface-and-usage
+                "memory" => memory,
+                "__memory_base" => memory_base,
+                "__table_base" => table_base,
+                "__indirect_function_table" => table,
+                "__stack_pointer" => stack_pointer,
+            },
+        };
+        // `start` is called during instantiation. During start, the memory is initialized
+        let mut library_instance = Instance::new(&mut store, &module, &module_imports).unwrap();
+        let exports = dbg!(&mut library_instance.exports);
+
+        let apply_data_relocs: TypedFunction<(), ()> = exports
+            .get_typed_function(&store, "__wasm_apply_data_relocs")
+            .unwrap();
+
+        // https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md#relocations :
+        // The module can export a function called __wasm_apply_data_relocs. If it is so exported, the loader will call it after the module is instantiated, and before any other function, including __wasm_call_ctors, is called.
+        apply_data_relocs.call(&mut store).unwrap();
+
+        self.dynamic_library = Some(DynamicLibrary {
+            instance: library_instance,
+            memory_base: memory_base_value,
+            table_base: table_base_value,
+        });
+
+        Ok(42)
+    }
+    pub fn experimental_dlsym(
+        &mut self,
+        symbol: &str,
+        mut store: StoreMut<'_>,
+    ) -> Result<u32, WasiError> {
+        let library = self.dynamic_library.as_mut().unwrap();
+        let exports = &mut library.instance.exports;
+        let export = exports.get_global(symbol).unwrap();
+        let value = export.get(&mut store).unwrap_i32() as u32;
+        let absolute_value = value.checked_add(library.memory_base).unwrap();
+
+        return Ok(absolute_value);
     }
 }

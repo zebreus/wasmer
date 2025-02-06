@@ -1,7 +1,7 @@
-use std::{fs::OpenOptions, io::BufReader};
-
 use super::*;
 use crate::syscalls::*;
+use std::{fs::OpenOptions, io::BufReader};
+use wasmer::{imports, TableType, Type};
 
 /// ### `dl_open()`
 /// Open a dynamic library
@@ -15,7 +15,6 @@ pub fn dl_open<M: MemorySize>(
     let env = ctx.data();
     let (memory, mut state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
     let filename = unsafe { get_input_str_ok!(&memory, filename, filename_len) };
-    error!("dl_open path: {} ", filename);
 
     Span::current().record("filename", filename.as_str());
 
@@ -25,7 +24,6 @@ pub fn dl_open<M: MemorySize>(
     let (memory, mut state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
 
     wasi_try_mem_ok!(handle.write(&memory, opened_handle));
-    println!("opened handle: {} ", opened_handle);
 
     Ok(Errno::Success)
 }
@@ -34,9 +32,6 @@ pub fn dl_open_internal(
     ctx: &mut FunctionEnvMut<'_, WasiEnv>,
     filename: &str,
 ) -> Result<u32, Errno> {
-    let env = ctx.data();
-    let (memory, mut state) = unsafe { env.get_memory_and_wasi_state(ctx, 0) };
-
     // Check if the directory exists
     let file = match OpenOptions::new().read(true).open(Path::new(filename)) {
         Ok(file) => file,
@@ -46,7 +41,9 @@ pub fn dl_open_internal(
             return Err(Errno::Noent);
         }
     };
-    let opened_file = file.bytes().collect::<Result<Vec<u8>, _>>();
+    let opened_file = file.bytes().collect::<Result<Vec<u8>, _>>().unwrap();
+    let (data, store) = ctx.data_and_store_mut();
+    let original_instance = data.experimental_dlopen(&opened_file, store).unwrap();
 
     Ok(5)
 }
