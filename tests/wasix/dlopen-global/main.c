@@ -17,5 +17,16 @@ int main() {
   }
   printf("foo = %d\n", *foo);
   assert(*foo == 42);
+
+  void (**indirect_function_call)();
+  indirect_function_call = dlsym(handle, "indirect_function_call");
+  (**indirect_function_call)();
+
+  void (*direct_function_call)();
+  direct_function_call = dlsym(handle, "direct_function_call");
+  // printf("print_test as ptr: %p\n", print_test);
+  // printf("print_test as size_t: %u\n", print_test);
+  (*direct_function_call)();
+
   exit(0);
 }
