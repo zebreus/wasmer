@@ -12,6 +12,11 @@ pub fn dl_open<M: MemorySize>(
     filename_len: M::Offset,
     handle: WasmPtr<u32, M>,
 ) -> Result<Errno, WasiError> {
+    // let env = ctx.data();
+    // let (memory, mut state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
+    // wasi_try_mem_ok!(handle.write(&memory, 5));
+    // return Ok(Errno::Success);
+
     let env = ctx.data();
     let (memory, mut state) = unsafe { env.get_memory_and_wasi_state(&ctx, 0) };
     let filename = unsafe { get_input_str_ok!(&memory, filename, filename_len) };
@@ -42,8 +47,7 @@ pub fn dl_open_internal(
         }
     };
     let opened_file = file.bytes().collect::<Result<Vec<u8>, _>>().unwrap();
-    let (data, store) = ctx.data_and_store_mut();
-    let original_instance = data.experimental_dlopen(&opened_file, store).unwrap();
+    let original_instance = WasiEnv::experimental_dlopen(ctx, &opened_file).unwrap();
 
     Ok(5)
 }

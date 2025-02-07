@@ -36,6 +36,7 @@ export LDFLAGS="\
 -Wl,--shared-memory \
 -Wl,--max-memory=4294967296 \
 -Wl,--import-memory \
+-Wl,--import-table \
 -Wl,--export-dynamic \
 -Wl,--export=__heap_base \
 -Wl,--export=__stack_pointer \

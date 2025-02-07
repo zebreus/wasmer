@@ -345,6 +345,9 @@ pub struct WasiEnv {
 
     /// TODO: Understand WasiInstanceHandles and use that instead
     pub dynamic_library: Option<DynamicLibrary>,
+
+    /// TODO: This does not belong here; move to the place where memory is stored.
+    pub indirect_function_table: Option<Table>,
 }
 
 struct DynamicLibrary {
@@ -382,6 +385,7 @@ impl Clone for WasiEnv {
             replaying_journal: self.replaying_journal,
             disable_fs_cleanup: self.disable_fs_cleanup,
             dynamic_library: None,
+            indirect_function_table: None,
         }
     }
 }
@@ -423,6 +427,7 @@ impl WasiEnv {
             replaying_journal: false,
             disable_fs_cleanup: self.disable_fs_cleanup,
             dynamic_library: None,
+            indirect_function_table: None,
         };
         Ok((new_env, handle))
     }
@@ -558,6 +563,7 @@ impl WasiEnv {
             capabilities: init.capabilities,
             disable_fs_cleanup: false,
             dynamic_library: None,
+            indirect_function_table: None,
         };
         env.owned_handles.push(thread);
 
@@ -632,6 +638,27 @@ impl WasiEnv {
             None
         };
 
+        // Determine if a shared indirect function table needs to be created and imported
+        // TODO: Handle the case when the module exports the table itself (possibly with a max size)
+        // TODO: Maybe do not create a table yet, when the module does not need one.
+        let imported_table_type = module
+            .imports()
+            .tables()
+            .find(|table| table.name() == "__indirect_function_table")
+            .map(|a| *a.ty());
+
+        let imported_table = if let Some(table_type) = imported_table_type {
+            // let table_type =
+            //     imported_table_type.unwrap_or(TableType::new(wasmer::Type::FuncRef, 0, None));
+            let shared_table = Table::new(&mut store, table_type, Value::FuncRef(None)).unwrap();
+            import_object.define("env", "__indirect_function_table", shared_table.clone());
+            Some(shared_table)
+        } else {
+            None
+        };
+        // TODO: This is a dirty hack, store the table at an appropriate place. It should probably be passed to `func_env.initialize_with_memory` a few lines below this
+        func_env.data_mut(&mut store).indirect_function_table = imported_table;
+
         // Construct the instance.
         let instance = match Instance::new(&mut store, &module, &import_object) {
             Ok(a) => a,
@@ -679,6 +706,177 @@ impl WasiEnv {
         }
 
         Ok((instance, func_env))
+    }
+
+    /// This function is loosely based on the `instantiate` function above.
+    /// It is used to instantiate an additional module into an existing environment.
+    /// TODO: Refactor the common code between instatiate and instantiate_lib into a separate function
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn instantiate_lib(
+        function_env: &mut FunctionEnvMut<'_, WasiEnv>,
+        module: Module,
+    ) -> Result<(), WasiRuntimeError> {
+        let envv = function_env.as_ref().clone();
+
+        let (wasienv, mut store) = function_env.data_and_store_mut();
+
+        // // TODO: Figure out how extra_tracing is set for initialize and also do that here
+        // if init.extra_tracing {
+        //     for import in module.imports() {
+        //         tracing::trace!("import {}.{}", import.module(), import.name());
+        //     }
+        // }
+
+        // // TODO: Figure out what additional imports could be and also make them available to libraries
+        // let additional_imports = init.additional_imports.clone();
+
+        let pid = wasienv.process.pid();
+
+        let shared_memory = module
+            .imports()
+            .memories()
+            .next()
+            .map(|a| *a.ty())
+            .expect("For now libraries must import their memory");
+
+        let memory = unsafe { wasienv.memory() }.clone();
+
+        let indirect_table = &mut wasienv.indirect_function_table;
+        let indirect_table = indirect_table
+            .as_mut()
+            .expect("TODO: Create a table, if there is none");
+        let indirect_table_size = indirect_table.size(&mut store);
+        // Buffer between the current size and the maximum size
+        // TODO: Find a better solution than hardcoding the value
+        const TABLE_BUFFER: u32 = 1000;
+        let table_base_value = indirect_table_size + TABLE_BUFFER;
+
+        // TODO: This is a crime. The value should probably be passed in via the dl_open syscall
+        let memory_base_value = 7000u32;
+        let memory_base = Global::new(&mut store, Value::I32(memory_base_value as i32));
+        let table_base = Global::new(&mut store, Value::I32(table_base_value as i32));
+        let stack_pointer = wasienv
+            .inner
+            .get()
+            .map(|i| i.stack_pointer.as_ref().unwrap())
+            .unwrap()
+            .clone();
+
+        let indirect_function_table_import = module
+            .imports()
+            .tables()
+            .find(|table| table.name() == "__indirect_function_table");
+        if let Some(indirect_function_table_import) = indirect_function_table_import {
+            // The table needs to be at least this big.
+            let minimum_table_size = indirect_function_table_import.ty().minimum + table_base_value;
+            // TODO: Handle when the table has a maximum size
+            indirect_table
+                .grow(
+                    &mut store,
+                    minimum_table_size - indirect_table_size,
+                    Value::FuncRef(None),
+                )
+                .unwrap();
+        }
+
+        let (mut import_object, instance_init_callback) =
+            import_object_for_all_wasi_versions(&module, &mut store, &envv);
+
+        // // TODO: Make imports from the environment available to the library
+        // for ((namespace, name), value) in &additional_imports {
+        //     // Note: We don't want to let downstream users override WASIX
+        //     // syscalls
+        //     if !import_object.exists(&namespace, &name) {
+        //         import_object.define(&namespace, &name, value);
+        //     }
+        // }
+
+        // Dynamic libraries use these five imports as described in:
+        // https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md#interface-and-usage
+        import_object.define("env", "memory", memory.clone());
+        import_object.define("env", "__memory_base", memory_base);
+        import_object.define("env", "__table_base", table_base);
+        import_object.define("env", "__stack_pointer", stack_pointer);
+        import_object.define("env", "__indirect_function_table", indirect_table.clone());
+
+        // TODO: Also make 'GOT' imports available to the library
+
+        // Construct the instance.
+        let instance = match Instance::new(&mut store, &module, &import_object) {
+            Ok(a) => a,
+            Err(err) => {
+                tracing::error!(
+                    %pid,
+                    error = &err as &dyn std::error::Error,
+                    "Instantiation failed",
+                );
+                function_env
+                    .data()
+                    .blocking_on_exit(Some(Errno::Noexec.into()));
+                return Err(err.into());
+            }
+        };
+
+        // Run initializers.
+        instance_init_callback(&instance, &store).unwrap();
+
+        // // I think we can omit this, as this mostly does stack things, which the dynamic library shares with the main module
+        // // Initialize the WASI environment
+        // if let Err(err) =
+        //     function_env.initialize_with_memory(&mut store, instance.clone(), imported_memory, true)
+        // {
+        //     tracing::error!(
+        //         %pid,
+        //         error = &err as &dyn std::error::Error,
+        //         "Initialization failed",
+        //     );
+        //     func_env
+        //         .data(&store)
+        //         .blocking_on_exit(Some(Errno::Noexec.into()));
+        //     return Err(err.into());
+        // }
+
+        // https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md#relocations :
+        // The module can export a function called __wasm_apply_data_relocs. If it is so exported, the loader will call it after the module is instantiated, and before any other function, including __wasm_call_ctors, is called.
+        if let Ok(apply_data_relocs) = instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "__wasm_apply_data_relocs")
+        {
+            apply_data_relocs.call(&mut store).unwrap();
+        }
+
+        // https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md#start-section
+        if let Ok(call_ctors) = instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "__wasm_call_ctors")
+        {
+            call_ctors.call(&mut store).unwrap();
+        } else {
+            tracing::warn!("No __wasm_call_ctors function found");
+        }
+
+        // // TODO: I think this only applies to the main module, not to shared libs.
+        // // Not sure how this applies to dynamic libraries, llvm does not seem to generate this function
+        // // https://github.com/WebAssembly/WASI/blob/main/legacy/application-abi.md#current-unstable-abi
+        // // If this module exports an _initialize function, run that first.
+        // if call_initialize {
+        //     if let Ok(initialize) = instance.exports.get_function("_initialize") {
+        //         if let Err(err) = crate::run_wasi_func_start(initialize, &mut store) {
+        //             func_env
+        //                 .data(&store)
+        //                 .blocking_on_exit(Some(Errno::Noexec.into()));
+        //             return Err(err);
+        //         }
+        //     }
+        // }
+
+        wasienv.dynamic_library = Some(DynamicLibrary {
+            instance: instance.clone(),
+            memory_base: memory_base_value,
+            table_base: table_base_value,
+        });
+
+        Ok(())
     }
 
     /// Returns a copy of the current runtime implementation for this environment
@@ -1358,50 +1556,17 @@ impl WasiEnv {
     }
 
     pub fn experimental_dlopen(
-        &mut self,
+        function_env: &mut FunctionEnvMut<'_, WasiEnv>,
         wasm: &[u8],
-        mut store: StoreMut<'_>,
     ) -> Result<u32, WasiError> {
-        let module = Module::new(&self.runtime.engine(), wasm).unwrap();
-        let memory = unsafe { self.memory() }.clone();
-        let memory_base_value = 7000u32;
-        let table_base_value = 8000u32;
-        let memory_base = Global::new(&mut store, Value::I32(memory_base_value as i32));
-        let table_base = Global::new(&mut store, Value::I32(table_base_value as i32));
-        let stack_pointer = Global::new(&mut store, Value::I32(12000 as i32));
+        let engine = &function_env.data().runtime.engine();
+        let mut module = Module::new(engine, wasm).unwrap();
+        // TODO: Set correct name
+        module.set_name("dynamic-library");
 
-        let table_type = TableType::new(wasmer::Type::FuncRef, 1, Some(1)); // anyref => ExternRef in Wasmer
-        let table = Table::new(&mut store, table_type, Value::FuncRef(None)).unwrap();
+        WasiEnv::instantiate_lib(function_env, module /* , module_hash, store */).unwrap();
 
-        let module_imports = imports! {
-            "env" => {
-                // These five imports are described in
-                // https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md#interface-and-usage
-                "memory" => memory,
-                "__memory_base" => memory_base,
-                "__table_base" => table_base,
-                "__indirect_function_table" => table,
-                "__stack_pointer" => stack_pointer,
-            },
-        };
-        // `start` is called during instantiation. During start, the memory is initialized
-        let mut library_instance = Instance::new(&mut store, &module, &module_imports).unwrap();
-        let exports = dbg!(&mut library_instance.exports);
-
-        let apply_data_relocs: TypedFunction<(), ()> = exports
-            .get_typed_function(&store, "__wasm_apply_data_relocs")
-            .unwrap();
-
-        // https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md#relocations :
-        // The module can export a function called __wasm_apply_data_relocs. If it is so exported, the loader will call it after the module is instantiated, and before any other function, including __wasm_call_ctors, is called.
-        apply_data_relocs.call(&mut store).unwrap();
-
-        self.dynamic_library = Some(DynamicLibrary {
-            instance: library_instance,
-            memory_base: memory_base_value,
-            table_base: table_base_value,
-        });
-
+        // TODO: Implement handles
         Ok(42)
     }
     pub fn experimental_dlsym(

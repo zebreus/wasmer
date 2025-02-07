@@ -19,4 +19,4 @@ $CC $CFLAGS $LDFLAGS -o side.wasm side.c
 
 $WASMER -q run main.wasm --mapdir=/code:. >output
 
-printf "handle: 0x5\nfoo = 42\n" | diff -u output - 1>/dev/null
+printf "side module ctor\nhandle: 0x5\nfoo = 42\n" | diff -u output - 1>/dev/null
