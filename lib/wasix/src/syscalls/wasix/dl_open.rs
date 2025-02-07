@@ -37,6 +37,8 @@ pub fn dl_open_internal(
     ctx: &mut FunctionEnvMut<'_, WasiEnv>,
     filename: &str,
 ) -> Result<u32, Errno> {
+    // TODO: Properly use the permission system of wasmer
+    // TODO: Handle relative paths and search paths like a real OS
     // Check if the directory exists
     let file = match OpenOptions::new().read(true).open(Path::new(filename)) {
         Ok(file) => file,

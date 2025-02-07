@@ -11,8 +11,8 @@ use rand::Rng;
 use virtual_fs::{FileSystem, FsError, VirtualFile};
 use virtual_net::DynVirtualNetworking;
 use wasmer::{
-    imports, AsStoreMut, AsStoreRef, FunctionEnvMut, Global, Imports, Instance, Memory, MemoryType,
-    MemoryView, Module, StoreMut, Table, TableType, TypedFunction, Value,
+    AsStoreMut, AsStoreRef, Extern, FunctionEnvMut, Global, Imports, Instance, Memory, MemoryType,
+    MemoryView, Module, StoreMut, Table, TypedFunction, Value,
 };
 use wasmer_config::package::PackageSource;
 use wasmer_wasix_types::{
@@ -1569,6 +1569,11 @@ impl WasiEnv {
         // TODO: Implement handles
         Ok(42)
     }
+
+    /// Load a symbol from the currently loaded library
+    ///
+    /// Returns a address into the linear memory for things that are in memory
+    /// Returns an index into the __indirect_function_table for functions
     pub fn experimental_dlsym(
         &mut self,
         symbol: &str,
@@ -1576,10 +1581,31 @@ impl WasiEnv {
     ) -> Result<u32, WasiError> {
         let library = self.dynamic_library.as_mut().unwrap();
         let exports = &mut library.instance.exports;
-        let export = exports.get_global(symbol).unwrap();
-        let value = export.get(&mut store).unwrap_i32() as u32;
-        let absolute_value = value.checked_add(library.memory_base).unwrap();
+        let export = exports.get_extern(symbol);
+        let value = match export {
+            Some(Extern::Global(global)) => {
+                let exported_value = global.get(&mut store).unwrap_i32() as u32;
+                // Add our memory base to all exported addresses.
+                // This is required, because exported globals are relative to the memory base
+                let absolute_value = exported_value.checked_add(library.memory_base).unwrap();
+                absolute_value
+            }
+            Some(Extern::Function(function)) => {
+                let function_table = self.indirect_function_table.as_mut().unwrap();
+                // TODO: Properly manage the function table instead of just stuffing functions in there
+                let new_element = function_table
+                    .grow(&mut store, 1, Value::FuncRef(Some(function.clone())))
+                    .unwrap();
+                new_element
+            }
+            _ => {
+                panic!(
+                    "Unsupported export type or missing export for symbol {}",
+                    symbol
+                );
+            }
+        };
 
-        return Ok(absolute_value);
+        return Ok(value);
     }
 }
